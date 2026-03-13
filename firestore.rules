@@ -1,0 +1,232 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function isSelf(uid) {
+      return signedIn() && request.auth.uid == uid;
+    }
+
+    function isAgent() {
+      return signedIn()
+        && exists(/databases/$(database)/documents/users/$(request.auth.uid))
+        && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == "agent";
+    }
+
+    function isAdmin() {
+      return signedIn()
+        && exists(/databases/$(database)/documents/users/$(request.auth.uid))
+        && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == "admin";
+    }
+
+    function myEmailLower() {
+      return signedIn() && request.auth.token.email != null
+        ? request.auth.token.email.lower()
+        : "";
+    }
+
+    function isAssignedRecruitId(recruitId) {
+      let r = get(/databases/$(database)/documents/recruits/$(recruitId)).data;
+      return signedIn() && (
+        r.assignedAgentUid == request.auth.uid
+        || (r.assignedAgentEmail != null && r.assignedAgentEmail.lower() == myEmailLower())
+        || (r.assignedAgentUids != null && request.auth.uid in r.assignedAgentUids)
+        || (r.assignedAgentEmails != null && myEmailLower() in r.assignedAgentEmails)
+      );
+    }
+
+    function isAssignedRecruitDoc() {
+      return signedIn() && resource != null && (
+        resource.data.assignedAgentUid == request.auth.uid
+        || (resource.data.assignedAgentEmail != null && resource.data.assignedAgentEmail.lower() == myEmailLower())
+        || (resource.data.assignedAgentUids != null && request.auth.uid in resource.data.assignedAgentUids)
+        || (resource.data.assignedAgentEmails != null && myEmailLower() in resource.data.assignedAgentEmails)
+      );
+    }
+
+function agentAllowedRecruitUpdate() {
+  return request.resource.data.diff(resource.data).changedKeys().hasOnly([
+    "relationshipRank",
+    "urgencyRank",
+    "status",
+    "level",
+    "levelOfUrgency",
+
+    "nextFollowUpAt",
+    "actionItemDueAt",
+    "nextFollowUpOwnerUid",
+
+    "lastActivityText",
+    "lastActivityAt",
+    "updatedAt",
+
+    "lastUpdatedByUid",
+    "lastUpdatedByName",
+    "lastUpdatedByRole",
+    "lastUpdatedAt"
+  ])
+  && request.resource.data.lastUpdatedByUid == request.auth.uid
+  && request.resource.data.lastUpdatedByRole == "agent"
+  && request.resource.data.lastUpdatedByName is string
+  && request.resource.data.lastActivityText is string;
+}
+
+
+
+    /* ------------------------------
+       USERS (profiles)
+    ------------------------------ */
+   match /users/{uid} {
+  allow read: if isSelf(uid) || signedIn();
+  allow create: if isSelf(uid);
+  allow update: if isSelf(uid) || isAdmin();
+  allow delete: if isAdmin();
+}
+
+    /* ------------------------------
+       AGENT NOTIFICATIONS
+    ------------------------------ */
+    match /agentNotifications/{id} {
+      allow read, list: if signedIn() && resource.data.agentUid == request.auth.uid;
+
+      allow update: if signedIn()
+        && resource.data.agentUid == request.auth.uid
+        && request.resource.data.diff(resource.data).changedKeys().hasOnly(["isRead"]);
+
+      allow create, delete: if false;
+    }
+
+    /* ------------------------------
+       RECRUIT EVENTS / ALERTS (LEGACY)
+       If you don't want this collection anymore, lock it down.
+       (You can still delete the old docs manually as admin.)
+    ------------------------------ */
+match /recruitEvents/{eventId} {
+  allow read, list: if isAdmin();     // ✅ admins can see legacy alerts
+  allow create, update: if false;     // keep locked down
+  allow delete: if isAdmin();
+
+
+
+      // If you want it read-only for admin instead, change to:
+      // allow read: if isAdmin();
+      // allow create, update: if false;
+      // allow delete: if isAdmin();
+    }
+
+    /* ------------------------------
+       RECRUITS
+    ------------------------------ */
+    match /recruits/{recruitId} {
+
+      allow read: if isAdmin() || isAssignedRecruitDoc();
+      allow create: if isAdmin();
+
+      allow update: if isAdmin()
+        || (isAssignedRecruitDoc() && isAgent() && agentAllowedRecruitUpdate());
+
+      allow delete: if isAdmin();
+
+      /* ------------------------------
+         EVENTS (CYA COUNTERS)
+      ------------------------------ */
+      match /events/{eventId} {
+        allow read: if isAdmin()
+          || (signedIn() && resource.data.authorUid == request.auth.uid)
+          || (
+            isAssignedRecruitId(recruitId)
+            && (resource.data.visibility == null || resource.data.visibility == "shared")
+          );
+
+        allow create: if isAdmin()
+          || (
+            isAssignedRecruitId(recruitId)
+            && signedIn()
+            && request.resource.data.authorUid == request.auth.uid
+            && request.resource.data.type is string
+            && (request.resource.data.visibility == null || request.resource.data.visibility == "shared")
+          );
+
+        allow update, delete: if isAdmin();
+      }
+
+      /* ------------------------------
+         ACTIVITY FEED (ADMIN ALERTS)
+         ✅ FIX: allow agents to UPDATE too (needed for deterministic IDs)
+      ------------------------------ */
+      match /activity/{activityId} {
+        allow read, list: if isAdmin() || isAssignedRecruitId(recruitId);
+
+        // Admin can write anything
+        allow create: if isAdmin()
+          || (
+            isAssignedRecruitId(recruitId)
+            && request.resource.data.actorUid == request.auth.uid
+          );
+
+        // ✅ Critical: allow agent UPDATE for dedupe writes,
+        // but ONLY if they are the actor and keep unreadByAdmins = true.
+        allow update: if isAdmin()
+          || (
+            isAssignedRecruitId(recruitId)
+            && request.resource.data.actorUid == request.auth.uid
+            && request.resource.data.unreadByAdmins == true
+            && request.resource.data.diff(resource.data).changedKeys().hasOnly([
+              "recruitId",
+              "recruitName",
+              "actorUid",
+              "actorName",
+              "actorRole",
+              "type",
+              "summary",
+              "changes",
+              "meta",
+              "unreadByAdmins",
+              "createdAt",
+              "source",
+              "sourceId"
+            ])
+          );
+
+        // Admin can mark read / cleanup
+        allow delete: if isAdmin();
+      }
+
+      /* ------------------------------
+         JOURNAL
+      ------------------------------ */
+      match /journal/{entryId} {
+        allow read, list: if isAdmin()
+          || (
+            isAssignedRecruitId(recruitId)
+            && (resource.data.visibility == null || resource.data.visibility == "shared")
+          );
+
+        allow create: if isAdmin()
+          || (
+            isAssignedRecruitId(recruitId)
+            && request.resource.data.authorUid == request.auth.uid
+            && (request.resource.data.visibility == null || request.resource.data.visibility == "shared")
+          );
+
+        allow update, delete: if isAdmin()
+          || (
+            isAssignedRecruitId(recruitId)
+            && resource.data.authorUid == request.auth.uid
+          );
+      }
+    }
+// ✅ GLOBAL: allow admins to read ANY subcollection named "activity"
+// This prevents collectionGroup("activity") from failing due to an unrelated activity collection elsewhere.
+match /{anyPath=**}/activity/{activityId} {
+  allow read, list: if isAdmin();
+}
+    // default deny
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
